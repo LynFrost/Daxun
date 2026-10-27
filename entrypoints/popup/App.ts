@@ -4,9 +4,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const slider = document.getElementById('volumeSlider') as HTMLInputElement;
   const valueDisplay = document.getElementById('volumeValue')!;
   const systemNotifyToggle = document.getElementById('systemNotifyToggle') as HTMLInputElement;
+  const previewToggle = document.getElementById('qaPreviewToggle') as HTMLInputElement;
   const soundList = document.getElementById('soundList')!;
   const VOLUME_STORAGE_KEY = 'chatgpt_notifier_volume';
   const SYSTEM_NOTIFICATION_KEY = 'chatgpt_notifier_system_notification_enabled';
+  const PREVIEW_KEY = 'chatgpt_notifier_qa_preview_enabled';
   const SOUND_STORAGE_KEY = 'chatgpt_notifier_sound_id';
   const SOUND_COLLAPSED_KEY = 'chatgpt_notifier_sound_collapsed';
 
@@ -82,7 +84,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   chrome.storage.local.get(
-    [VOLUME_STORAGE_KEY, SYSTEM_NOTIFICATION_KEY, SOUND_STORAGE_KEY, SOUND_COLLAPSED_KEY],
+    [VOLUME_STORAGE_KEY, SYSTEM_NOTIFICATION_KEY, PREVIEW_KEY, SOUND_STORAGE_KEY, SOUND_COLLAPSED_KEY],
     (result) => {
       let vol: number = result[VOLUME_STORAGE_KEY] as number;
       if (typeof vol !== 'number') vol = 0.5;
@@ -92,6 +94,7 @@ document.addEventListener('DOMContentLoaded', () => {
       updateSliderBackground(slider);
 
       systemNotifyToggle.checked = result[SYSTEM_NOTIFICATION_KEY] === true;
+      previewToggle.checked = result[PREVIEW_KEY] === true; // default off for privacy
 
       activeSoundId = (result[SOUND_STORAGE_KEY] as string) || 'default';
       setSoundOpen(result[SOUND_COLLAPSED_KEY] !== false);
@@ -109,6 +112,12 @@ document.addEventListener('DOMContentLoaded', () => {
   systemNotifyToggle.addEventListener('change', (e) => {
     chrome.storage.local.set({
       [SYSTEM_NOTIFICATION_KEY]: (e.target as HTMLInputElement).checked,
+    });
+  });
+
+  previewToggle.addEventListener('change', (e) => {
+    chrome.storage.local.set({
+      [PREVIEW_KEY]: (e.target as HTMLInputElement).checked,
     });
   });
 });

@@ -116,9 +116,166 @@ export default defineContentScript({
     const QUIET_FALLBACK_MS = 30000;
     const POLL_MS = 500;
     const DIAGNOSTIC_MS = 45000;
+    const QUESTION_PREVIEW_LIMIT = 50;
+    const ANSWER_PREVIEW_LIMIT = 100;
+    const ANSWER_BODY_SELECTORS = [
+      '.markdown',
+      '[data-testid="message-text"]',
+      '[data-message-content]',
+      '.prose',
+    ];
+    const ANSWER_EXCLUDE_SELECTOR = [
+      'button', 'nav', 'header', 'footer', 'svg', 'script', 'style',
+      '[hidden]', '[aria-hidden="true"]', '[role="toolbar"]', '[role="button"]',
+      '[data-conversation-role]', 'details',
+      '[data-testid*="thinking"]', '[data-testid*="reasoning"]',
+      '[data-testid*="tool"]', '[data-testid*="activity"]',
+      '[data-testid*="feedback"]', '[data-testid*="share"]',
+      '[role="status"]', '[aria-live]', '[aria-expanded="false"]', 'summary',
+      '[class*="thinking" i]', '[class*="reasoning" i]',
+      '[aria-label*="thinking" i]', '[aria-label*="tool" i]',
+      '.sr-only',
+    ].join(',');
+
+    function summarize(text: string, limit: number): string {
+      const normalized = text.replace(/\s+/g, ' ').trim();
+      const characters = Array.from(normalized);
+      return characters.length > limit ? characters.slice(0, limit).join('') + '……' : normalized;
+    }
+
+    function captureQuestionPreview(trigger: EventTarget | null): string {
+      // Only look inside the form that is actually being submitted.
+      // A global [contenteditable="true"] query could read an unrelated editor.
+      try {
+        const form = trigger instanceof Element ? trigger.closest('form') : null;
+        if (!form) return '';
+
+        const selectors = [
+          '#prompt-textarea',
+          'textarea[name="prompt-textarea"]',
+          '[contenteditable="true"][data-placeholder]',
+          '[contenteditable="true"]',
+        ];
+        for (const selector of selectors) {
+          const editors = Array.from(form.querySelectorAll<HTMLElement>(selector))
+            .filter((element) => !element.closest('[hidden], [aria-hidden="true"]'));
+          const focused = document.activeElement;
+          const composer = editors.length === 1
+            ? editors[0]
+            : editors.find((element) => focused && (element === focused || element.contains(focused)));
+          if (!composer) continue;
+          const text = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+            ? composer.value
+            : composer.innerText ?? composer.textContent ?? '';
+          const preview = summarize(text, QUESTION_PREVIEW_LIMIT);
+          if (preview) {
+            console.debug('[ReplyNotice/content] Question preview captured:', {
+              selector, length: Array.from(preview).length,
+            });
+            return preview;
+          }
+        }
+        console.debug('[ReplyNotice/content] No non-empty composer text found at submission');
+      } catch (error) {
+        console.warn('[ReplyNotice/content] Question preview extraction failed:', error);
+      }
+      return '';
+    }
+
+    function visibleResponseText(root: Element, semanticOnly = false): string {
+      const semanticSelector = 'p, li, blockquote, pre, code, h1, h2, h3, h4, h5, h6, td, th';
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const fragments: string[] = [];
+      let current: Node | null;
+      while ((current = walker.nextNode())) {
+        const parent = current.parentElement;
+        if (!parent || !current.textContent?.trim()) continue;
+        if (semanticOnly && !parent.closest(semanticSelector)) continue;
+
+        let visible = true;
+        // Check the entire ancestor chain up to and including the scoped root.
+        // In particular, do not include closed thinking panels, hidden text or tool status.
+        for (let ancestor: Element | null = parent; ancestor; ancestor = ancestor.parentElement) {
+          if (ancestor.matches(ANSWER_EXCLUDE_SELECTOR)) {
+            visible = false;
+            break;
+          }
+          const style = getComputedStyle(ancestor);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') {
+            visible = false;
+            break;
+          }
+          if (ancestor === root) break;
+        }
+        if (visible) fragments.push(current.textContent);
+      }
+      return fragments.join(' ');
+    }
+
+    function extractAnswerPreview(assistant: Element): string {
+      try {
+        // Prefer explicit answer body regions when ChatGPT provides them.
+        for (const selector of ANSWER_BODY_SELECTORS) {
+          const candidates = Array.from(assistant.querySelectorAll(selector));
+          if (assistant.matches(selector)) candidates.unshift(assistant);
+          const eligible = candidates.filter((element) =>
+            !element.closest(ANSWER_EXCLUDE_SELECTOR) &&
+            !candidates.some((ancestor) => ancestor !== element && ancestor.contains(element)),
+          );
+          const body = eligible.map((element) => visibleResponseText(element)).filter(Boolean).join(' ');
+          const preview = summarize(body, ANSWER_PREVIEW_LIMIT);
+          if (preview) {
+            console.debug('[ReplyNotice/content] Answer preview from body selector:', {
+              selector, length: Array.from(preview).length,
+            });
+            return preview;
+          }
+        }
+
+        // The new renderer exposes an assistant turn, but may have none of the
+        // old .markdown/.prose wrappers. Stay within this verified turn and only
+        // extract visible answer text; never use its raw textContent.
+        const isAssistantTurn = assistant.matches('[data-turn-key]') &&
+          assistant.querySelector('[data-conversation-role="assistant"]') !== null;
+        if (!isAssistantTurn || !hasCompletionAction(assistant)) return '';
+
+        const semanticBody = summarize(visibleResponseText(assistant, true), ANSWER_PREVIEW_LIMIT);
+        if (semanticBody) {
+          console.debug('[ReplyNotice/content] Answer preview from semantic fallback:', {
+            length: Array.from(semanticBody).length,
+          });
+          return semanticBody;
+        }
+
+        // Some short responses are rendered as unmarked text nodes in DIVs.
+        // If any unrecognized thinking/tool panel exists, fail closed rather than
+        // risk showing process details on the Windows lock screen.
+        const ambiguousProcess = assistant.querySelector([
+          'details', '[role="status"]', '[aria-live]',
+          '[data-testid*="thinking"]', '[data-testid*="reasoning"]',
+          '[data-testid*="tool"]', '[data-testid*="activity"]',
+          '[class*="thinking" i]', '[class*="reasoning" i]',
+          '[aria-label*="thinking" i]', '[aria-label*="tool" i]',
+        ].join(',')) !== null;
+        if (!ambiguousProcess) {
+          const plainBody = summarize(visibleResponseText(assistant), ANSWER_PREVIEW_LIMIT);
+          if (plainBody) {
+            console.debug('[ReplyNotice/content] Answer preview from guarded text fallback:', {
+              length: Array.from(plainBody).length,
+            });
+            return plainBody;
+          }
+        }
+        console.debug('[ReplyNotice/content] Answer body could not be safely extracted');
+      } catch (error) {
+        console.warn('[ReplyNotice/content] Answer preview extraction failed:', error);
+      }
+      return '';
+    }
 
     type ReplyCycle = {
       id: string;
+      questionPreview: string;
       user: Element | null;
       baselineAssistant: Element | null;
       newUserSeen: boolean;
@@ -161,11 +318,17 @@ export default defineContentScript({
     let lastSubmitAt = 0;
     let cycleSequence = 0;
 
-    function beginCycle(reason: string, user: Element | null = latest(USER_SELECTOR)) {
+    function beginCycle(reason: string, user: Element | null = latest(USER_SELECTOR), questionPreview = '') {
       cycleSequence += 1;
       const now = Date.now();
+      // An activity signal immediately following the same submit must not lose
+      // the pending question snapshot.
+      if (!questionPreview && cycle && now - lastSubmitAt < 10000 && !cycle.notified) {
+        questionPreview = cycle.questionPreview;
+      }
       cycle = {
         id: now + '-' + cycleSequence + '-' + crypto.randomUUID(),
+        questionPreview,
         user,
         baselineAssistant: latest(ASSISTANT_SELECTOR),
         newUserSeen: false,
@@ -187,28 +350,35 @@ export default defineContentScript({
       return !!form?.querySelector('#prompt-textarea, [contenteditable="true"], textarea[name="prompt-textarea"]');
     }
 
-    function onSubmitIntent() {
+    function onSubmitIntent(trigger: EventTarget | null) {
       const now = Date.now();
-      if (now - lastSubmitAt < 700) return;
+      // Preserve one snapshot when a click, keydown and submit all fire.
+      if (now - lastSubmitAt < 700) {
+        if (cycle && !cycle.notified && !cycle.questionPreview) {
+          cycle.questionPreview = captureQuestionPreview(trigger);
+        }
+        return;
+      }
+      const questionPreview = captureQuestionPreview(trigger);
       lastSubmitAt = now;
-      beginCycle('composer submitted');
+      beginCycle('composer submitted', latest(USER_SELECTOR), questionPreview);
     }
 
     document.addEventListener('submit', (event) => {
-      if (composerContains(event.target)) onSubmitIntent();
+      if (composerContains(event.target)) onSubmitIntent(event.target);
     }, true);
     document.addEventListener('click', (event) => {
       const target = event.target;
       if (!(target instanceof Element)) return;
       const button = target.closest('button[data-testid="send-button"], button[aria-label="Send prompt"]');
-      if (button && composerContains(button)) onSubmitIntent();
+      if (button && composerContains(button)) onSubmitIntent(button);
     }, true);
     document.addEventListener('keydown', (event) => {
       if (event.key !== 'Enter' || event.shiftKey || event.isComposing || !composerContains(event.target)) return;
-      onSubmitIntent();
+      onSubmitIntent(event.target);
     }, true);
 
-    function notifyBackground(reply: ReplyCycle) {
+    function notifyBackground(reply: ReplyCycle, assistant: Element) {
       try {
         chrome.runtime.sendMessage({
           type: 'CHATGPT_REPLY_DONE',
@@ -216,6 +386,9 @@ export default defineContentScript({
           payload: {
             title: '答讯 · ReplyNotice',
             message: 'ChatGPT has finished responding.',
+            questionPreview: reply.questionPreview,
+            answerPreview: extractAnswerPreview(assistant),
+            conversationUrl: location.href,
           },
         }, (response?: { status?: string; detail?: string }) => {
           const error = chrome.runtime.lastError;
@@ -295,7 +468,7 @@ export default defineContentScript({
       if (assistant && ((completed && quietFor >= QUIET_WITH_COPY_MS) || fallback)) {
         reply.notified = true;
         console.info('[ReplyNotice/content] Final reply detected:', reply.id, completed ? 'completion action' : 'quiet fallback');
-        notifyBackground(reply);
+        notifyBackground(reply, assistant);
       } else if (!reply.warned && now - reply.startedAt >= DIAGNOSTIC_MS) {
         reply.warned = true;
         console.warn('[ReplyNotice/content] No confirmed reply completion yet; check ChatGPT selectors/activity:', {
