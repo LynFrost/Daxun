@@ -80,13 +80,6 @@ export default defineContentScript({
         doneTimerId = setTimeout(() => {
           if (document.querySelector(STREAM_SELECTORS) === null) {
             playNotification();
-            chrome.runtime.sendMessage({
-              type: 'CHATGPT_REPLY_DONE',
-              payload: {
-                title: 'ChatGPT Notifier',
-                message: 'ChatGPT has finished responding.',
-              },
-            });
             isStreaming = false;
           }
           doneTimerId = null;
@@ -94,17 +87,240 @@ export default defineContentScript({
       }
     }
 
+    // ChatGPT's thinking/tool phases and generation all count as activity.
+    // The notification detector is separate from the existing sound behavior.
+    const ACTIVE_SELECTORS = [
+      STREAM_SELECTORS,
+      'button[aria-label="Stop generating"]',
+      'button[aria-label="Stop response"]',
+      'button[aria-label="停止生成"]',
+      '[data-message-author-role="assistant"][aria-busy="true"]',
+      '[data-is-streaming="true"]',
+      '[data-testid="thinking-indicator"]',
+    ].join(',');
+    const USER_SELECTOR = '[data-message-author-role="user"], [data-role="user"]';
+    const ASSISTANT_SELECTOR = '[data-message-author-role="assistant"], [data-role="assistant"]';
+    const RESPONSE_COPY_SELECTOR = [
+      'button[data-testid="copy-turn-action-button"]',
+      'button[data-testid="copy-response-button"]',
+      'button[aria-label="Copy"]',
+      'button[aria-label="Copy response"]',
+      'button[aria-label="复制"]',
+      'button[aria-label="复制回复"]',
+    ].join(',');
+    const QUIET_WITH_COPY_MS = 2500;
+    const QUIET_FALLBACK_MS = 30000;
+    const POLL_MS = 500;
+    const DIAGNOSTIC_MS = 45000;
+
+    type ReplyCycle = {
+      id: string;
+      user: Element | null;
+      baselineAssistant: Element | null;
+      newUserSeen: boolean;
+      assistant: Element | null;
+      signature: string;
+      startedAt: number;
+      lastContentChangeAt: number;
+      quietSince: number | null;
+      activeSeen: boolean;
+      notified: boolean;
+      warned: boolean;
+    };
+
+    function latest(selector: string): Element | null {
+      const nodes = document.querySelectorAll(selector);
+      return nodes.length ? nodes[nodes.length - 1] : null;
+    }
+
+    function findResponse(user: Element | null): Element | null {
+      const assistant = latest(ASSISTANT_SELECTOR);
+      if (!assistant) return null;
+      if (user?.isConnected && !(user.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+        return null;
+      }
+      return assistant;
+    }
+
+    function hasCompletionAction(assistant: Element): boolean {
+      const turn = assistant.closest('[data-testid^="conversation-turn-"], [data-turn-key], article') || assistant;
+      return turn.querySelector(RESPONSE_COPY_SELECTOR) !== null;
+    }
+
+    function responseSignature(assistant: Element): string {
+      return (assistant.textContent || '') + '|' + assistant.querySelectorAll('img, canvas, video, pre, table').length;
+    }
+
+    let knownUser = latest(USER_SELECTOR);
+    let route = location.pathname + location.search;
+    let cycle: ReplyCycle | null = null;
+    let lastSubmitAt = 0;
+    let cycleSequence = 0;
+
+    function beginCycle(reason: string, user: Element | null = latest(USER_SELECTOR)) {
+      cycleSequence += 1;
+      const now = Date.now();
+      cycle = {
+        id: now + '-' + cycleSequence + '-' + crypto.randomUUID(),
+        user,
+        baselineAssistant: latest(ASSISTANT_SELECTOR),
+        newUserSeen: false,
+        assistant: null,
+        signature: '',
+        startedAt: now,
+        lastContentChangeAt: now,
+        quietSince: null,
+        activeSeen: false,
+        notified: false,
+        warned: false,
+      };
+      console.debug('[ReplyNotice/content] Tracking reply cycle:', cycle.id, reason);
+    }
+
+    function composerContains(target: EventTarget | null): boolean {
+      if (!(target instanceof Element)) return false;
+      const form = target.closest('form');
+      return !!form?.querySelector('#prompt-textarea, [contenteditable="true"], textarea[name="prompt-textarea"]');
+    }
+
+    function onSubmitIntent() {
+      const now = Date.now();
+      if (now - lastSubmitAt < 700) return;
+      lastSubmitAt = now;
+      beginCycle('composer submitted');
+    }
+
+    document.addEventListener('submit', (event) => {
+      if (composerContains(event.target)) onSubmitIntent();
+    }, true);
+    document.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const button = target.closest('button[data-testid="send-button"], button[aria-label="Send prompt"]');
+      if (button && composerContains(button)) onSubmitIntent();
+    }, true);
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' || event.shiftKey || event.isComposing || !composerContains(event.target)) return;
+      onSubmitIntent();
+    }, true);
+
+    function notifyBackground(reply: ReplyCycle) {
+      try {
+        chrome.runtime.sendMessage({
+          type: 'CHATGPT_REPLY_DONE',
+          cycleId: reply.id,
+          payload: {
+            title: '答讯 · ReplyNotice',
+            message: 'ChatGPT has finished responding.',
+          },
+        }, (response?: { status?: string; detail?: string }) => {
+          const error = chrome.runtime.lastError;
+          if (error) {
+            console.error('[ReplyNotice/content] Sending completion message failed:', error.message);
+          } else if (response?.status === 'error' || response?.status === 'permission-denied') {
+            console.error('[ReplyNotice/content] Background could not create notification:', response);
+          } else {
+            console.debug('[ReplyNotice/content] Background completion result:', response?.status);
+          }
+        });
+      } catch (error) {
+        console.error('[ReplyNotice/content] Sending completion message threw:', error);
+      }
+    }
+
+    function checkSystemNotification() {
+      const now = Date.now();
+      const currentRoute = location.pathname + location.search;
+      const user = latest(USER_SELECTOR);
+      const active = document.querySelector(ACTIVE_SELECTORS) !== null;
+
+      if (currentRoute !== route) {
+        route = currentRoute;
+        if (!cycle || cycle.notified) cycle = null;
+        else if (cycle.user && !cycle.user.isConnected) cycle.user = user;
+        knownUser = user;
+      }
+
+      if (user !== knownUser) {
+        knownUser = user;
+        if (user && cycle && !cycle.notified && cycle.user !== user) {
+          if (!cycle.newUserSeen && now - lastSubmitAt < 10000) {
+            cycle.user = user;
+            cycle.newUserSeen = true;
+          } else if (active && cycle.user?.isConnected) {
+            beginCycle('another user turn observed', user);
+            if (cycle) cycle.newUserSeen = true;
+          } else if (!cycle.user?.isConnected) {
+            cycle.user = user;
+          }
+        }
+      }
+
+      if ((!cycle || (cycle.notified && active && user !== cycle.user)) && active) {
+        beginCycle('generation activity observed', user);
+        if (cycle) cycle.newUserSeen = true;
+      }
+      const reply = cycle;
+      if (!reply || reply.notified) return;
+
+      if (reply.user && !reply.user.isConnected) reply.user = user;
+      const assistant = findResponse(reply.user);
+      if (assistant !== reply.assistant) {
+        reply.assistant = assistant;
+        reply.signature = assistant ? responseSignature(assistant) : '';
+        reply.lastContentChangeAt = now;
+      } else if (assistant) {
+        const signature = responseSignature(assistant);
+        if (signature !== reply.signature) {
+          reply.signature = signature;
+          reply.lastContentChangeAt = now;
+        }
+      }
+
+      if (active) {
+        reply.activeSeen = true;
+        reply.quietSince = null;
+        return;
+      }
+
+      if (reply.quietSince === null) reply.quietSince = now;
+      const quietFor = now - Math.max(reply.quietSince, reply.lastContentChangeAt);
+      const hasNewResponse = reply.activeSeen || reply.newUserSeen || (!!assistant && assistant !== reply.baselineAssistant);
+      const completed = hasNewResponse && !!assistant && hasCompletionAction(assistant);
+      const fallback = reply.activeSeen && !!assistant && !!reply.signature.trim() && quietFor >= QUIET_FALLBACK_MS;
+      if (assistant && ((completed && quietFor >= QUIET_WITH_COPY_MS) || fallback)) {
+        reply.notified = true;
+        console.info('[ReplyNotice/content] Final reply detected:', reply.id, completed ? 'completion action' : 'quiet fallback');
+        notifyBackground(reply);
+      } else if (!reply.warned && now - reply.startedAt >= DIAGNOSTIC_MS) {
+        reply.warned = true;
+        console.warn('[ReplyNotice/content] No confirmed reply completion yet; check ChatGPT selectors/activity:', {
+          cycleId: reply.id, activeSeen: reply.activeSeen, active, assistantFound: !!assistant, completionActionFound: completed,
+        });
+      }
+    }
+
+    let queued = false;
     const observer = new MutationObserver(() => {
-      queueMicrotask(checkStreaming);
+      if (queued) return;
+      queued = true;
+      queueMicrotask(() => {
+        queued = false;
+        checkStreaming();
+        checkSystemNotification();
+      });
     });
 
     observer.observe(document.body, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['class', 'data-testid', 'aria-busy'],
+      characterData: true,
+      attributeFilter: ['class', 'data-testid', 'aria-busy', 'aria-label', 'data-is-streaming'],
     });
 
+    setInterval(checkSystemNotification, POLL_MS);
     checkStreaming();
+    checkSystemNotification();
   },
 });
