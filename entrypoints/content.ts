@@ -116,9 +116,82 @@ export default defineContentScript({
     const QUIET_FALLBACK_MS = 30000;
     const POLL_MS = 500;
     const DIAGNOSTIC_MS = 45000;
+    const QUESTION_PREVIEW_LIMIT = 50;
+    const ANSWER_PREVIEW_LIMIT = 100;
+    const ANSWER_BODY_SELECTORS = [
+      '.markdown',
+      '[data-testid="message-text"]',
+      '[data-message-content]',
+      '.prose',
+    ];
+    const ANSWER_EXCLUDE_SELECTOR = [
+      'button', 'nav', 'header', 'footer', 'svg', 'script', 'style',
+      '[hidden]', '[aria-hidden="true"]', '[role="toolbar"]', '[role="button"]',
+      '[data-conversation-role]', 'details',
+      '[data-testid*="thinking"]', '[data-testid*="reasoning"]',
+      '[data-testid*="tool"]', '[data-testid*="activity"]',
+      '.sr-only',
+    ].join(',');
+
+    function summarize(text: string, limit: number): string {
+      const normalized = text.replace(/\s+/g, ' ').trim();
+      const characters = Array.from(normalized);
+      return characters.length > limit ? characters.slice(0, limit).join('') + '……' : normalized;
+    }
+
+    function captureQuestionPreview(): string {
+      // Capture before ChatGPT clears its composer; do not read historical turns.
+      const composer = document.querySelector<HTMLElement>(
+        '#prompt-textarea, textarea[name="prompt-textarea"], [contenteditable="true"][data-placeholder]',
+      );
+      if (!composer) return '';
+      const text = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+        ? composer.value
+        : composer.innerText || composer.textContent || '';
+      return summarize(text, QUESTION_PREVIEW_LIMIT);
+    }
+
+    function visibleResponseText(root: Element): string {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const fragments: string[] = [];
+      let current: Node | null;
+      while ((current = walker.nextNode())) {
+        const parent = current.parentElement;
+        if (!parent || !current.textContent?.trim()) continue;
+        if (parent.closest(ANSWER_EXCLUDE_SELECTOR)) continue;
+        let visible = true;
+        for (let ancestor: Element | null = parent; ancestor && root.contains(ancestor); ancestor = ancestor.parentElement) {
+          const style = getComputedStyle(ancestor);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') {
+            visible = false;
+            break;
+          }
+        }
+        if (visible) fragments.push(current.textContent);
+      }
+      return fragments.join(' ');
+    }
+
+    function extractAnswerPreview(assistant: Element): string {
+      // Prefer rendered answer blocks, never the whole turn (which also contains
+      // toolbar labels, thinking details and tool progress).
+      for (const selector of ANSWER_BODY_SELECTORS) {
+        const candidates = Array.from(assistant.querySelectorAll(selector));
+        if (assistant.matches(selector)) candidates.unshift(assistant);
+        const eligible = candidates.filter((element) =>
+          !element.closest(ANSWER_EXCLUDE_SELECTOR) &&
+          !candidates.some((ancestor) => ancestor !== element && ancestor.contains(element)),
+        );
+        const body = eligible.map(visibleResponseText).filter(Boolean).join(' ');
+        const preview = summarize(body, ANSWER_PREVIEW_LIMIT);
+        if (preview) return preview;
+      }
+      return '';
+    }
 
     type ReplyCycle = {
       id: string;
+      questionPreview: string;
       user: Element | null;
       baselineAssistant: Element | null;
       newUserSeen: boolean;
@@ -161,11 +234,17 @@ export default defineContentScript({
     let lastSubmitAt = 0;
     let cycleSequence = 0;
 
-    function beginCycle(reason: string, user: Element | null = latest(USER_SELECTOR)) {
+    function beginCycle(reason: string, user: Element | null = latest(USER_SELECTOR), questionPreview = '') {
       cycleSequence += 1;
       const now = Date.now();
+      // An activity signal immediately following the same submit must not lose
+      // the pending question snapshot.
+      if (!questionPreview && cycle && now - lastSubmitAt < 10000 && !cycle.notified) {
+        questionPreview = cycle.questionPreview;
+      }
       cycle = {
         id: now + '-' + cycleSequence + '-' + crypto.randomUUID(),
+        questionPreview,
         user,
         baselineAssistant: latest(ASSISTANT_SELECTOR),
         newUserSeen: false,
@@ -191,7 +270,7 @@ export default defineContentScript({
       const now = Date.now();
       if (now - lastSubmitAt < 700) return;
       lastSubmitAt = now;
-      beginCycle('composer submitted');
+      beginCycle('composer submitted', latest(USER_SELECTOR), captureQuestionPreview());
     }
 
     document.addEventListener('submit', (event) => {
@@ -208,7 +287,7 @@ export default defineContentScript({
       onSubmitIntent();
     }, true);
 
-    function notifyBackground(reply: ReplyCycle) {
+    function notifyBackground(reply: ReplyCycle, assistant: Element) {
       try {
         chrome.runtime.sendMessage({
           type: 'CHATGPT_REPLY_DONE',
@@ -216,6 +295,9 @@ export default defineContentScript({
           payload: {
             title: '答讯 · ReplyNotice',
             message: 'ChatGPT has finished responding.',
+            questionPreview: reply.questionPreview,
+            answerPreview: extractAnswerPreview(assistant),
+            conversationUrl: location.href,
           },
         }, (response?: { status?: string; detail?: string }) => {
           const error = chrome.runtime.lastError;
@@ -295,7 +377,7 @@ export default defineContentScript({
       if (assistant && ((completed && quietFor >= QUIET_WITH_COPY_MS) || fallback)) {
         reply.notified = true;
         console.info('[ReplyNotice/content] Final reply detected:', reply.id, completed ? 'completion action' : 'quiet fallback');
-        notifyBackground(reply);
+        notifyBackground(reply, assistant);
       } else if (!reply.warned && now - reply.startedAt >= DIAGNOSTIC_MS) {
         reply.warned = true;
         console.warn('[ReplyNotice/content] No confirmed reply completion yet; check ChatGPT selectors/activity:', {
