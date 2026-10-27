@@ -99,7 +99,11 @@ export default defineContentScript({
       '[data-testid="thinking-indicator"]',
     ].join(',');
     const USER_SELECTOR = '[data-message-author-role="user"], [data-role="user"]';
-    const ASSISTANT_SELECTOR = '[data-message-author-role="assistant"], [data-role="assistant"]';
+    const ASSISTANT_SELECTOR = [
+      '[data-turn-key]:has([data-conversation-role="assistant"])',
+      '[data-message-author-role="assistant"]',
+      '[data-role="assistant"]',
+    ].join(',');
     const RESPONSE_COPY_SELECTOR = [
       'button[data-testid="copy-turn-action-button"]',
       'button[data-testid="copy-response-button"]',
