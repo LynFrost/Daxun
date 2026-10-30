@@ -147,8 +147,61 @@ export default defineBackground(() => {
   });
 
   chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
-    // Button 0 is "清空全部". A button click never navigates to ChatGPT.
-    if (buttonIndex !== 0) return;
+    if (buttonIndex === 0) {
+      // "关闭" only dismisses this notification. Do not navigate or
+      // interfere with any other notification in Windows Notification Center.
+      const forgetClosedOrigin = () => {
+        // A concurrent body click has requested its own origin snapshot.
+        if (pendingNotificationClicks.has(notificationId)) return;
+        chrome.storage.session.remove(NOTIFICATION_ORIGIN_PREFIX + notificationId, () => {
+          const storageError = chrome.runtime.lastError;
+          if (storageError) {
+            console.warn('[ReplyNotice/background] Could not forget closed notification origin:', {
+              notificationId, detail: storageError.message,
+            });
+          }
+        });
+      };
+
+      try {
+        chrome.notifications.clear(notificationId, (wasCleared) => {
+          const clearError = chrome.runtime.lastError;
+          if (clearError) {
+            console.warn('[ReplyNotice/background] Could not close notification:', {
+              notificationId, detail: clearError.message,
+            });
+            return;
+          }
+          if (wasCleared) {
+            forgetClosedOrigin();
+            return;
+          }
+
+          // A second event may have removed it before the callback ran.
+          // Preserve the mapping if the notification is still active.
+          chrome.notifications.getAll((remaining) => {
+            const checkError = chrome.runtime.lastError;
+            if (checkError) {
+              console.warn('[ReplyNotice/background] Could not verify closed notification:', {
+                notificationId, detail: checkError.message,
+              });
+            } else if (!Object.prototype.hasOwnProperty.call(remaining || {}, notificationId)) {
+              forgetClosedOrigin();
+            } else {
+              console.warn('[ReplyNotice/background] Notification was not closed:', notificationId);
+            }
+          });
+        });
+      } catch (error) {
+        console.warn('[ReplyNotice/background] Closing notification threw:', {
+          notificationId, error,
+        });
+      }
+      return;
+    }
+
+    // Button 1 is "清空全部". Unknown button indexes do nothing.
+    if (buttonIndex !== 1) return;
 
     // getAll() is scoped to notifications managed by this extension, not all
     // Windows notifications. Take a single snapshot: do not clear new arrivals.
@@ -295,7 +348,10 @@ export default defineBackground(() => {
           message: payload?.message || 'ChatGPT has finished responding.',
           priority: 1,
           requireInteraction: true,
-          buttons: [{ title: '清空全部' }],
+          buttons: [
+            { title: '关闭' },
+            { title: '清空全部' },
+          ],
         }, (notificationId) => {
           const error = chrome.runtime.lastError;
           if (error || !notificationId) {
