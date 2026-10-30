@@ -6,6 +6,7 @@ export default defineBackground(() => {
   const MAX_ORIGINS = 100;
   const HOME_URL = 'https://chatgpt.com/';
   const notifiedCycles = new Set<string>();
+  const pendingNotificationClicks = new Set<string>();
   const MAX_REMEMBERED_CYCLES = 200;
 
   type NotificationMessage = {
@@ -87,10 +88,32 @@ export default defineBackground(() => {
 
   chrome.notifications.onClicked.addListener((notificationId) => {
     const key = NOTIFICATION_ORIGIN_PREFIX + notificationId;
+    // Read the origin before clearing: clear() may fire onClosed, and the
+    // native banner may already have moved into Windows Notification Center.
+    pendingNotificationClicks.add(notificationId);
     chrome.storage.session.get([key], (result) => {
       const error = chrome.runtime.lastError;
       const origin = result?.[key] as NotificationOrigin | undefined;
+      pendingNotificationClicks.delete(notificationId);
       chrome.storage.session.remove(key);
+
+      // Only clear the clicked notification. A missing/already-dismissed
+      // notification must not block navigation to its original conversation.
+      try {
+        chrome.notifications.clear(notificationId, (wasCleared) => {
+          const clearError = chrome.runtime.lastError;
+          if (clearError) {
+            console.warn('[ReplyNotice/background] Could not clear clicked notification:', clearError.message);
+          } else {
+            console.debug('[ReplyNotice/background] Clicked notification clear result:', {
+              notificationId, wasCleared,
+            });
+          }
+        });
+      } catch (clearError) {
+        console.warn('[ReplyNotice/background] Clearing clicked notification threw:', clearError);
+      }
+
       const url = trustedConversationUrl(origin?.url) || HOME_URL;
       if (error || !origin || typeof origin.tabId !== 'number' ||
           typeof origin.createdAt !== 'number' || Date.now() - origin.createdAt > ORIGIN_TTL_MS) {
@@ -123,7 +146,19 @@ export default defineBackground(() => {
     });
   });
 
-  chrome.notifications.onClosed.addListener((notificationId) => {
+  chrome.notifications.onClosed.addListener((notificationId, byUser) => {
+    // Edge/Windows may retire the desktop banner while keeping a clickable
+    // notification in Notification Center. The platform's automatic close
+    // event must not erase the origin prematurely. TTL (24 h) and the
+    // 100-entry cap in pruneOrigins() bound retained mappings.
+    if (!byUser) {
+      console.debug('[ReplyNotice/background] System-closed notification origin retained:', notificationId);
+      return;
+    }
+    // A click can also generate onClosed. Keep the mapping until the
+    // onClicked handler has obtained its snapshot.
+    if (pendingNotificationClicks.has(notificationId)) return;
+    // Explicit user dismissal (X) only cleans up; it never opens ChatGPT.
     chrome.storage.session.remove(NOTIFICATION_ORIGIN_PREFIX + notificationId);
   });
 
@@ -154,6 +189,7 @@ export default defineBackground(() => {
           title: payload?.title || '答讯 · ReplyNotice',
           message: payload?.message || 'ChatGPT has finished responding.',
           priority: 1,
+          requireInteraction: true,
         }, (notificationId) => {
           const error = chrome.runtime.lastError;
           if (error || !notificationId) {
