@@ -93,6 +93,111 @@ export default defineBackground(() => {
     });
   }
 
+
+  const MAX_NOTIFICATIONS = 3;
+  const NOTIFICATION_QUEUE_KEY = 'replynotice_notification_queue';
+  let notificationOperation = Promise.resolve();
+
+  // Serialize create/evict and "清空全部", including their storage writes.
+  function enqueueNotificationOperation<T>(work: () => Promise<T>): Promise<T> {
+    const current = notificationOperation.then(work);
+    notificationOperation = current.then(() => undefined, () => undefined);
+    return current;
+  }
+
+  function listManagedNotifications(): Promise<Record<string, boolean>> {
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.notifications.getAll((notifications) => {
+          const error = chrome.runtime.lastError;
+          if (error) reject(new Error(error.message));
+          else resolve(notifications || {});
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  function readNotificationQueue(): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+      chrome.storage.session.get([NOTIFICATION_QUEUE_KEY], (stored) => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          reject(new Error(error.message));
+          return;
+        }
+        const value: unknown = stored[NOTIFICATION_QUEUE_KEY];
+        const queue = Array.isArray(value) ? value.filter((id): id is string =>
+          typeof id === 'string' && id.length > 0) : [];
+        resolve([...new Set(queue)]);
+      });
+    });
+  }
+
+  function saveNotificationQueue(queue: string[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+      chrome.storage.session.set({ [NOTIFICATION_QUEUE_KEY]: queue }, () => {
+        const error = chrome.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve();
+      });
+    });
+  }
+
+  async function clearManagedNotification(id: string): Promise<boolean> {
+    const wasCleared = await new Promise<boolean>((resolve, reject) => {
+      try {
+        chrome.notifications.clear(id, (cleared) => {
+          const error = chrome.runtime.lastError;
+          if (error) reject(new Error(error.message));
+          else resolve(cleared);
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+    if (wasCleared) return true;
+    // A click or close event may have removed it before the callback.
+    const remaining = await listManagedNotifications();
+    return !Object.prototype.hasOwnProperty.call(remaining, id);
+  }
+
+  function forgetNotificationOrigin(id: string): Promise<void> {
+    // A body click has already requested the origin snapshot; let it finish.
+    if (pendingNotificationClicks.has(id)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      chrome.storage.session.remove(NOTIFICATION_ORIGIN_PREFIX + id, () => {
+        const error = chrome.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve();
+      });
+    });
+  }
+
+  async function reconcileNotificationQueue(): Promise<string[]> {
+    const stored = await readNotificationQueue();
+    const actual = await listManagedNotifications();
+    const queue = stored.filter((id) => Object.prototype.hasOwnProperty.call(actual, id));
+    const known = new Set(queue);
+    const untracked = Object.keys(actual).filter((id) => !known.has(id));
+
+    if (untracked.length) {
+      // After an upgrade/restart, old notifications have no trustworthy
+      // creation order. Reset just those untracked notices instead of
+      // pretending an ID sort identifies the oldest.
+      console.warn('[ReplyNotice/background] Resetting untracked notifications (unknown FIFO order):', untracked.length);
+      for (const id of untracked) {
+        if (!await clearManagedNotification(id)) {
+          throw new Error('Could not clear untracked notification: ' + id);
+        }
+        await forgetNotificationOrigin(id);
+      }
+    }
+    await saveNotificationQueue(queue);
+    return queue;
+  }
+
   function openChat(url: string) {
     chrome.tabs.create({ url }, () => {
       if (chrome.runtime.lastError) {
@@ -223,105 +328,41 @@ export default defineBackground(() => {
     // Button 1 is "清空全部". Unknown button indexes do nothing.
     if (buttonIndex !== 1) return;
 
-    // getAll() is scoped to notifications managed by this extension, not all
-    // Windows notifications. Take a single snapshot: do not clear new arrivals.
-    try {
-      chrome.notifications.getAll((notifications) => {
-        const listError = chrome.runtime.lastError;
-        if (listError) {
-          console.error('[ReplyNotice/background] Could not list notifications to clear:', listError.message);
-          return;
-        }
+    // Serialize the snapshot and every clear with new notification creation.
+    void enqueueNotificationOperation(async () => {
+      const notifications = await listManagedNotifications();
+      const ids = Object.keys(notifications);
+      let cleared = 0;
+      let alreadyAbsent = 0;
+      let failed = 0;
 
-        const ids = Object.keys(notifications || {});
-        if (!ids.length) {
-          console.info('[ReplyNotice/background] Clear-all: no managed notifications');
-          return;
-        }
-
-        let remaining = ids.length;
-        let cleared = 0;
-        let alreadyAbsent = 0;
-        let failed = 0;
-
-        function finishOne() {
-          remaining -= 1;
-          if (remaining === 0) {
-            console.info('[ReplyNotice/background] Clear-all complete:', {
-              requested: ids.length, cleared, alreadyAbsent, failed,
-            });
-          }
-        }
-
-        function forgetOrigin(id: string) {
-          // A concurrent onClicked handler has already requested its origin
-          // snapshot. Let that handler finish before removing the mapping.
-          if (pendingNotificationClicks.has(id)) {
-            finishOne();
-            return;
-          }
-          chrome.storage.session.remove(NOTIFICATION_ORIGIN_PREFIX + id, () => {
-            const storageError = chrome.runtime.lastError;
-            if (storageError) {
-              console.warn('[ReplyNotice/background] Could not forget cleared notification origin:', {
-                notificationId: id, detail: storageError.message,
-              });
-            }
-            finishOne();
-          });
-        }
-
-        for (const id of ids) {
-          try {
-            chrome.notifications.clear(id, (wasCleared) => {
-              const clearError = chrome.runtime.lastError;
-              if (clearError) {
-                failed += 1;
-                console.warn('[ReplyNotice/background] Clear-all failed for notification:', {
-                  notificationId: id, detail: clearError.message,
-                });
-                finishOne();
-                return;
-              }
-
-              if (wasCleared) {
-                cleared += 1;
-                forgetOrigin(id);
-                return;
-              }
-
-              // It may have disappeared since the getAll() snapshot.
-              // Verify absence before discarding its click-target mapping.
-              chrome.notifications.getAll((stillPresent) => {
-                const checkError = chrome.runtime.lastError;
-                if (checkError) {
-                  failed += 1;
-                  console.warn('[ReplyNotice/background] Could not verify missing notification:', {
-                    notificationId: id, detail: checkError.message,
-                  });
-                  finishOne();
-                } else if (Object.prototype.hasOwnProperty.call(stillPresent || {}, id)) {
-                  failed += 1;
-                  console.warn('[ReplyNotice/background] Notification still exists after clear:', id);
-                  finishOne();
-                } else {
-                  alreadyAbsent += 1;
-                  forgetOrigin(id);
-                }
-              });
-            });
-          } catch (clearError) {
+      for (const id of ids) {
+        try {
+          const removed = await clearManagedNotification(id);
+          if (!removed) {
             failed += 1;
-            console.warn('[ReplyNotice/background] Clear-all threw for notification:', {
-              notificationId: id, error: clearError,
-            });
-            finishOne();
+            console.warn('[ReplyNotice/background] Notification still exists after clear:', id);
+            continue;
           }
+          if (Object.prototype.hasOwnProperty.call(notifications, id)) cleared += 1;
+          await forgetNotificationOrigin(id);
+        } catch (error) {
+          failed += 1;
+          console.warn('[ReplyNotice/background] Clear-all failed for notification:', { notificationId: id, error });
         }
+      }
+
+      // Preserve only notifications that actually survived (e.g. clear failed).
+      const remaining = await listManagedNotifications();
+      const queue = await readNotificationQueue();
+      await saveNotificationQueue(queue.filter((id) =>
+        Object.prototype.hasOwnProperty.call(remaining, id)));
+      console.info('[ReplyNotice/background] Clear-all complete:', {
+        requested: ids.length, cleared, alreadyAbsent, failed,
       });
-    } catch (error) {
-      console.error('[ReplyNotice/background] Listing managed notifications threw:', error);
-    }
+    }).catch((error) => {
+      console.error('[ReplyNotice/background] Clear-all failed:', error);
+    });
   });
 
   chrome.notifications.onClosed.addListener((notificationId, byUser) => {
@@ -361,44 +402,69 @@ export default defineBackground(() => {
         return;
       }
 
-      try {
-        chrome.notifications.create(notificationId || '', {
-          type: 'basic',
-          iconUrl: chrome.runtime.getURL('logo.png'),
-          title: payload?.title || '答讯 · ReplyNotice',
-          message: payload?.message || 'ChatGPT has finished responding.',
-          priority: 1,
-          requireInteraction: true,
-          buttons: [
-            { title: '关闭' },
-            { title: '清空全部' },
-          ],
-        }, (notificationId) => {
-          const error = chrome.runtime.lastError;
-          if (error || !notificationId) {
-            console.error('[ReplyNotice/background] Notification creation failed:', error?.message || 'No notification ID returned');
-            sendResponse({ status: 'error', detail: error?.message || 'No notification ID returned' });
-            return;
+      void enqueueNotificationOperation(async () => {
+        const queue = await reconcileNotificationQueue();
+        const updatingExisting = !!notificationId && queue.includes(notificationId);
+        if (!updatingExisting) {
+          while (queue.length >= MAX_NOTIFICATIONS) {
+            const oldestId = queue[0];
+            // Do not create a fourth notification until clear is confirmed.
+            if (!await clearManagedNotification(oldestId)) {
+              throw new Error('Could not free notification slot: ' + oldestId);
+            }
+            await forgetNotificationOrigin(oldestId);
+            queue.shift();
+            await saveNotificationQueue(queue);
           }
-          // Successful creation does not guarantee a Windows banner (Focus Assist / DND / Edge settings).
-          const finish = () => {
-            console.info('[ReplyNotice/background] Notification created:', notificationId);
-            sendResponse({ status: 'created' });
-          };
-          if (origin) {
-            rememberOrigin(notificationId, origin, () => {
-              pruneOrigins();
-              finish();
+        }
+
+        const createdId = await new Promise<string>((resolve, reject) => {
+          try {
+            chrome.notifications.create(notificationId || '', {
+              type: 'basic',
+              iconUrl: chrome.runtime.getURL('logo.png'),
+              title: payload?.title || '答讯 · ReplyNotice',
+              message: payload?.message || 'ChatGPT has finished responding.',
+              priority: 1,
+              requireInteraction: true,
+              buttons: [
+                { title: '关闭' },
+                { title: '清空全部' },
+              ],
+            }, (createdId) => {
+              const error = chrome.runtime.lastError;
+              if (error || !createdId) {
+                reject(new Error(error?.message || 'No notification ID returned'));
+              } else {
+                resolve(createdId);
+              }
             });
-          } else {
-            finish();
+          } catch (error) {
+            reject(error);
           }
         });
-      } catch (error) {
+
+        // Re-delivery of an existing remote ID keeps its original FIFO place.
+        if (!queue.includes(createdId)) queue.push(createdId);
+        await saveNotificationQueue(queue);
+
+        if (origin) {
+          await new Promise<void>((resolve) => {
+            rememberOrigin(createdId, origin, () => {
+              pruneOrigins();
+              resolve();
+            });
+          });
+        }
+        // Successful create does not guarantee a Windows banner (DND / Edge).
+        console.info('[ReplyNotice/background] Notification created:', createdId);
+      }).then(() => {
+        sendResponse({ status: 'created' });
+      }).catch((error) => {
         const detail = error instanceof Error ? error.message : String(error);
-        console.error('[ReplyNotice/background] Notification API threw:', detail);
+        console.error('[ReplyNotice/background] Notification operation failed:', detail);
         sendResponse({ status: 'error', detail });
-      }
+      });
     });
   }
 
