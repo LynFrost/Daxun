@@ -146,6 +146,164 @@ export default defineBackground(() => {
     });
   });
 
+  chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
+    if (buttonIndex === 0) {
+      // "关闭" only dismisses this notification. Do not navigate or
+      // interfere with any other notification in Windows Notification Center.
+      const forgetClosedOrigin = () => {
+        // A concurrent body click has requested its own origin snapshot.
+        if (pendingNotificationClicks.has(notificationId)) return;
+        chrome.storage.session.remove(NOTIFICATION_ORIGIN_PREFIX + notificationId, () => {
+          const storageError = chrome.runtime.lastError;
+          if (storageError) {
+            console.warn('[ReplyNotice/background] Could not forget closed notification origin:', {
+              notificationId, detail: storageError.message,
+            });
+          }
+        });
+      };
+
+      try {
+        chrome.notifications.clear(notificationId, (wasCleared) => {
+          const clearError = chrome.runtime.lastError;
+          if (clearError) {
+            console.warn('[ReplyNotice/background] Could not close notification:', {
+              notificationId, detail: clearError.message,
+            });
+            return;
+          }
+          if (wasCleared) {
+            forgetClosedOrigin();
+            return;
+          }
+
+          // A second event may have removed it before the callback ran.
+          // Preserve the mapping if the notification is still active.
+          chrome.notifications.getAll((remaining) => {
+            const checkError = chrome.runtime.lastError;
+            if (checkError) {
+              console.warn('[ReplyNotice/background] Could not verify closed notification:', {
+                notificationId, detail: checkError.message,
+              });
+            } else if (!Object.prototype.hasOwnProperty.call(remaining || {}, notificationId)) {
+              forgetClosedOrigin();
+            } else {
+              console.warn('[ReplyNotice/background] Notification was not closed:', notificationId);
+            }
+          });
+        });
+      } catch (error) {
+        console.warn('[ReplyNotice/background] Closing notification threw:', {
+          notificationId, error,
+        });
+      }
+      return;
+    }
+
+    // Button 1 is "清空全部". Unknown button indexes do nothing.
+    if (buttonIndex !== 1) return;
+
+    // getAll() is scoped to notifications managed by this extension, not all
+    // Windows notifications. Take a single snapshot: do not clear new arrivals.
+    try {
+      chrome.notifications.getAll((notifications) => {
+        const listError = chrome.runtime.lastError;
+        if (listError) {
+          console.error('[ReplyNotice/background] Could not list notifications to clear:', listError.message);
+          return;
+        }
+
+        const ids = Object.keys(notifications || {});
+        if (!ids.length) {
+          console.info('[ReplyNotice/background] Clear-all: no managed notifications');
+          return;
+        }
+
+        let remaining = ids.length;
+        let cleared = 0;
+        let alreadyAbsent = 0;
+        let failed = 0;
+
+        function finishOne() {
+          remaining -= 1;
+          if (remaining === 0) {
+            console.info('[ReplyNotice/background] Clear-all complete:', {
+              requested: ids.length, cleared, alreadyAbsent, failed,
+            });
+          }
+        }
+
+        function forgetOrigin(id: string) {
+          // A concurrent onClicked handler has already requested its origin
+          // snapshot. Let that handler finish before removing the mapping.
+          if (pendingNotificationClicks.has(id)) {
+            finishOne();
+            return;
+          }
+          chrome.storage.session.remove(NOTIFICATION_ORIGIN_PREFIX + id, () => {
+            const storageError = chrome.runtime.lastError;
+            if (storageError) {
+              console.warn('[ReplyNotice/background] Could not forget cleared notification origin:', {
+                notificationId: id, detail: storageError.message,
+              });
+            }
+            finishOne();
+          });
+        }
+
+        for (const id of ids) {
+          try {
+            chrome.notifications.clear(id, (wasCleared) => {
+              const clearError = chrome.runtime.lastError;
+              if (clearError) {
+                failed += 1;
+                console.warn('[ReplyNotice/background] Clear-all failed for notification:', {
+                  notificationId: id, detail: clearError.message,
+                });
+                finishOne();
+                return;
+              }
+
+              if (wasCleared) {
+                cleared += 1;
+                forgetOrigin(id);
+                return;
+              }
+
+              // It may have disappeared since the getAll() snapshot.
+              // Verify absence before discarding its click-target mapping.
+              chrome.notifications.getAll((stillPresent) => {
+                const checkError = chrome.runtime.lastError;
+                if (checkError) {
+                  failed += 1;
+                  console.warn('[ReplyNotice/background] Could not verify missing notification:', {
+                    notificationId: id, detail: checkError.message,
+                  });
+                  finishOne();
+                } else if (Object.prototype.hasOwnProperty.call(stillPresent || {}, id)) {
+                  failed += 1;
+                  console.warn('[ReplyNotice/background] Notification still exists after clear:', id);
+                  finishOne();
+                } else {
+                  alreadyAbsent += 1;
+                  forgetOrigin(id);
+                }
+              });
+            });
+          } catch (clearError) {
+            failed += 1;
+            console.warn('[ReplyNotice/background] Clear-all threw for notification:', {
+              notificationId: id, error: clearError,
+            });
+            finishOne();
+          }
+        }
+      });
+    } catch (error) {
+      console.error('[ReplyNotice/background] Listing managed notifications threw:', error);
+    }
+  });
+
   chrome.notifications.onClosed.addListener((notificationId, byUser) => {
     // Edge/Windows may retire the desktop banner while keeping a clickable
     // notification in Notification Center. The platform's automatic close
@@ -190,6 +348,10 @@ export default defineBackground(() => {
           message: payload?.message || 'ChatGPT has finished responding.',
           priority: 1,
           requireInteraction: true,
+          buttons: [
+            { title: '关闭' },
+            { title: '清空全部' },
+          ],
         }, (notificationId) => {
           const error = chrome.runtime.lastError;
           if (error || !notificationId) {
