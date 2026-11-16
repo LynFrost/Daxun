@@ -1,3 +1,5 @@
+import { NtfySubscription, SYNC_KEYS, SYNC_TITLE, GENERIC_MESSAGE, ensureDeviceId, publishSyncEvent, readSyncSettings, validDeviceName, validTopic } from '@/lib/ntfySync';
+
 export default defineBackground(() => {
   const SYSTEM_NOTIFICATION_KEY = 'chatgpt_notifier_system_notification_enabled';
   const PREVIEW_KEY = 'chatgpt_notifier_qa_preview_enabled';
@@ -8,9 +10,22 @@ export default defineBackground(() => {
   const notifiedCycles = new Set<string>();
   const pendingNotificationClicks = new Set<string>();
   const MAX_REMEMBERED_CYCLES = 200;
+  const REMOTE_NOTIFICATION_PREFIX = 'replynotice_remote_';
+  const sync = new NtfySubscription((event) => {
+    // Type is encoded in the notification ID so it survives worker suspension.
+    chrome.storage.local.get([SYSTEM_NOTIFICATION_KEY], (settings) => {
+      if (chrome.runtime.lastError || settings[SYSTEM_NOTIFICATION_KEY] !== true) return;
+      const source = event.deviceName.replace(/[\r\n]/g, ' ');
+      createSystemNotification({
+        title: SYNC_TITLE,
+        message: '来源：' + source + '\n' + event.message,
+      }, () => {}, undefined, REMOTE_NOTIFICATION_PREFIX + event.eventId);
+    });
+  });
+  sync.start();
 
   type NotificationMessage = {
-    type: 'CHATGPT_REPLY_DONE' | 'CHATGPT_TEST_NOTIFICATION';
+    type: 'CHATGPT_REPLY_DONE' | 'CHATGPT_TEST_NOTIFICATION' | 'REPLYNOTICE_SYNC_STATUS' | 'REPLYNOTICE_SYNC_TEST';
     cycleId?: string;
     payload?: {
       title?: string;
@@ -87,6 +102,11 @@ export default defineBackground(() => {
   }
 
   chrome.notifications.onClicked.addListener((notificationId) => {
+    if (notificationId.startsWith(REMOTE_NOTIFICATION_PREFIX)) {
+      // Remote notifications can never navigate, even after SW restart.
+      chrome.notifications.clear(notificationId, () => { void chrome.runtime.lastError; });
+      return;
+    }
     const key = NOTIFICATION_ORIGIN_PREFIX + notificationId;
     // Read the origin before clearing: clear() may fire onClosed, and the
     // native banner may already have moved into Windows Notification Center.
@@ -326,6 +346,7 @@ export default defineBackground(() => {
     payload: NotificationMessage['payload'],
     sendResponse: (response: { status: string; detail?: string }) => void,
     origin?: NotificationOrigin,
+    notificationId?: string,
   ) {
     chrome.notifications.getPermissionLevel((level) => {
       const permissionError = chrome.runtime.lastError;
@@ -341,7 +362,7 @@ export default defineBackground(() => {
       }
 
       try {
-        chrome.notifications.create({
+        chrome.notifications.create(notificationId || '', {
           type: 'basic',
           iconUrl: chrome.runtime.getURL('logo.png'),
           title: payload?.title || '答讯 · ReplyNotice',
@@ -383,6 +404,35 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
     const message = rawMessage as NotificationMessage | null;
+    if (message?.type === 'REPLYNOTICE_SYNC_STATUS' || message?.type === 'REPLYNOTICE_SYNC_TEST') {
+      // Only extension pages may request status or a deliberate sync test.
+      if (sender.id !== chrome.runtime.id || sender.tab || !sender.url?.startsWith(chrome.runtime.getURL(''))) {
+        sendResponse({ status: 'invalid-message' });
+        return;
+      }
+      if (message.type === 'REPLYNOTICE_SYNC_STATUS') {
+        sendResponse({ status: 'ok', connection: sync.status() });
+        return;
+      }
+      chrome.storage.local.get(Object.values(SYNC_KEYS), async (stored) => {
+        if (chrome.runtime.lastError) {
+          sendResponse({ status: 'error', detail: '读取设置失败' });
+          return;
+        }
+        const settings = readSyncSettings(stored);
+        if (!settings.send || !validTopic(settings.topic) || !validDeviceName(settings.deviceName)) {
+          sendResponse({ status: 'invalid-config', detail: '请启用发送并配置有效主题及设备名称' });
+          return;
+        }
+        try {
+          await publishSyncEvent(settings, await ensureDeviceId(), 'ReplyNotice cross-computer test.', 'test');
+          sendResponse({ status: 'sent' });
+        } catch (error) {
+          sendResponse({ status: 'error', detail: error instanceof Error ? error.message : '发送失败' });
+        }
+      });
+      return true;
+    }
     if (message?.type !== 'CHATGPT_REPLY_DONE' && message?.type !== 'CHATGPT_TEST_NOTIFICATION') {
       return;
     }
@@ -402,6 +452,12 @@ export default defineBackground(() => {
       return;
     }
 
+    const senderUrl = trustedConversationUrl(sender.url);
+    if (!senderUrl) {
+      console.warn('[ReplyNotice/background] Reply completion came from an untrusted page');
+      sendResponse({ status: 'invalid-message' });
+      return;
+    }
     const key = sender.tab.id + ':' + message.cycleId;
     if (notifiedCycles.has(key)) {
       console.info('[ReplyNotice/background] Duplicate reply completion ignored:', key);
@@ -414,21 +470,29 @@ export default defineBackground(() => {
     }
 
     console.info('[ReplyNotice/background] Reply completion received:', key);
-    const senderUrl = trustedConversationUrl(sender.url);
-    if (!senderUrl) {
-      console.warn('[ReplyNotice/background] Reply completion came from an untrusted page');
-      sendResponse({ status: 'invalid-message' });
-      return;
-    }
-    chrome.storage.local.get([SYSTEM_NOTIFICATION_KEY, PREVIEW_KEY], (result) => {
+    chrome.storage.local.get([SYSTEM_NOTIFICATION_KEY, PREVIEW_KEY, ...Object.values(SYNC_KEYS)], (result) => {
       const error = chrome.runtime.lastError;
       if (error) {
         console.error('[ReplyNotice/background] Notification setting lookup failed:', error.message);
         sendResponse({ status: 'error', detail: error.message });
         return;
       }
-      if (result[SYSTEM_NOTIFICATION_KEY] !== true) {
-        console.info('[ReplyNotice/background] System Notification is off; skipping:', key);
+      const previewEnabled = result[PREVIEW_KEY] === true;
+      const localText = notificationText(message.payload, previewEnabled);
+      const settings = readSyncSettings(result);
+      const localEnabled = result[SYSTEM_NOTIFICATION_KEY] === true;
+      if (settings.send) {
+        if (!validTopic(settings.topic) || !validDeviceName(settings.deviceName)) {
+          console.warn('[ReplyNotice/background] Cross-computer sending not configured');
+        } else {
+          // Independent of local notification permissions and completion callback.
+          const remoteText = previewEnabled && settings.sharePreview ? localText : GENERIC_MESSAGE;
+          void ensureDeviceId()
+            .then((deviceId) => publishSyncEvent(settings, deviceId, remoteText))
+            .catch((err) => console.warn('[ReplyNotice/background] Cross-computer send failed:', err instanceof Error ? err.message : 'unknown'));
+        }
+      }
+      if (!localEnabled) {
         sendResponse({ status: 'disabled' });
         return;
       }
@@ -438,8 +502,8 @@ export default defineBackground(() => {
         createdAt: Date.now(),
       };
       createSystemNotification({
-        title: '答讯 · ReplyNotice',
-        message: notificationText(message.payload, result[PREVIEW_KEY] === true),
+        title: SYNC_TITLE,
+        message: localText,
       }, sendResponse, origin);
     });
     return true;
