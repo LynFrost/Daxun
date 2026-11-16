@@ -34,6 +34,33 @@
       </label>
     </div>
     <div class="hint-text">Display question and answer excerpts in system notifications. Off by default for privacy.</div>
+
+    <div class="sync-section">
+      <div class="section-title">跨电脑通知同步</div>
+      <div class="hint-text">使用 ntfy.sh 公共主题。随机主题并非加密或身份认证；知晓主题的人可以收发消息。请勿同步敏感内容。</div>
+      <div class="toggle-row">
+        <label for="syncSendToggle">允许跨电脑发送</label>
+        <label class="switch"><input type="checkbox" id="syncSendToggle"><span class="switch-slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <label for="syncReceiveToggle">允许跨电脑接收</label>
+        <label class="switch"><input type="checkbox" id="syncReceiveToggle"><span class="switch-slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <label for="syncPreviewToggle">允许远程传输问答摘要</label>
+        <label class="switch"><input type="checkbox" id="syncPreviewToggle"><span class="switch-slider"></span></label>
+      </div>
+      <div class="hint-text">默认关闭。只有同时开启本机问答预览及此授权才会发送摘要；否则仅发送通用提醒。摘要会经过第三方 ntfy.sh。</div>
+      <label for="syncNameInput">本机设备名称</label>
+      <input class="sync-input" id="syncNameInput" type="text" maxlength="40" placeholder="例如 XF / 工位电脑">
+      <label for="syncTopicInput">通信主题（多台电脑填写相同主题）</label>
+      <input class="sync-input" id="syncTopicInput" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="至少22位的随机主题">
+      <div class="sync-actions">
+        <button type="button" id="syncGenerateTopic">生成随机主题</button>
+        <button type="button" id="syncTestButton">发送测试消息</button>
+      </div>
+      <div class="hint-text" id="syncStatus" role="status" aria-live="polite">跨电脑同步默认关闭</div>
+    </div>
     <div class="footer">
       <span class="version" id="versionLabel"></span>
       <a class="github-link" href="https://github.com/Taragryen/chatgpt-notifier" target="_blank" title="GitHub">

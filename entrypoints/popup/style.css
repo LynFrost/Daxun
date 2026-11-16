@@ -256,3 +256,34 @@ input[type="range"]::-webkit-slider-thumb:hover {
   background: #d1d5db;
   border-radius: 2px;
 }
+
+.sync-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-top: 1px solid #e5e5e5;
+  padding-top: 16px;
+}
+.section-title { font-size: 14px; font-weight: 600; color: #343541; }
+.sync-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 8px;
+  font: 12px inherit;
+  font-family: inherit;
+  overflow: hidden;
+}
+.sync-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.sync-actions button {
+  flex: 1;
+  border: 1px solid #d1d5db;
+  background: #f9f9fb;
+  border-radius: 6px;
+  padding: 8px 4px;
+  color: #343541;
+  cursor: pointer;
+  font-size: 12px;
+}
+#syncStatus { overflow-wrap: anywhere; }
